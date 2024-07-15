@@ -11,6 +11,7 @@ import torch.nn as nn
 import torchvision
 from torchvision import transforms
 from transformers import BertTokenizer, BertModel
+from torch.nn.utils.rnn import pad_sequence
 
 
 def set_seed(seed):
@@ -70,6 +71,17 @@ class VQADataset(torch.utils.data.Dataset):
         self.answer = answer
         self.tokenizer = tokenizer  # Tokenizer for questions
 
+        # 質問文に含まれる単語を辞書に追加
+        self.question2idx = {}
+        self.idx2question = {}
+        for question in self.df["question"]:
+            question = process_text(question)
+            words = question.split(" ")
+            for word in words:
+                if word not in self.question2idx:
+                    self.question2idx[word] = len(self.question2idx)
+        self.idx2question = {v: k for k, v in self.question2idx.items()}  # 逆変換用の辞書(question)
+
         # 回答に含まれる単語を辞書に追加
         self.answer2idx = {}
         self.idx2answer = {}
@@ -82,7 +94,9 @@ class VQADataset(torch.utils.data.Dataset):
             self.idx2answer = {v: k for k, v in self.answer2idx.items()}  # 逆変換用の辞書(answer)
 
     def update_dict(self, dataset):
+        self.question2idx = dataset.question2idx
         self.answer2idx = dataset.answer2idx
+        self.idx2question = dataset.idx2question
         self.idx2answer = dataset.idx2answer
 
     def __getitem__(self, idx):
@@ -234,22 +248,22 @@ def ResNet50():
 
 
 class VQAModel(nn.Module):
-    def __init__(self, vocab_size: int, n_answer: int):
+    def __init__(self, n_answer: int):
         super().__init__()
         self.resnet = ResNet18()
         self.text_encoder = BertModel.from_pretrained('bert-base-uncased')
         self.fc = nn.Sequential(
-            nn.Linear(1024, 512),
+            nn.Linear(512 + 768, 512),  # 修正: 512（ResNetの出力）+ 768（BERTの出力）
             nn.ReLU(inplace=True),
             nn.Linear(512, n_answer)
         )
 
     def forward(self, image, question):
-        image_feature = self.resnet(image)  # 画像の特徴量
-        question_feature = self.text_encoder(**question).pooler_output  # テキストの特徴量
+        image_feature = self.resnet(image)  # 画像の特徴量 (batch_size, 512)
+        question_feature = self.text_encoder(**question).pooler_output  # テキストの特徴量 (batch_size, 768)
 
-        x = torch.cat([image_feature, question_feature], dim=1)
-        x = self.fc(x)
+        x = torch.cat([image_feature, question_feature], dim=1)  # 結合 (batch_size, 1280)
+        x = self.fc(x)  # 全結合層への入力
 
         return x
 
@@ -300,6 +314,29 @@ def eval(model, dataloader, optimizer, criterion, device):
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
 
 
+def collate_fn(batch):
+    images, questions, answers, mode_answers = zip(*batch)
+
+    # 画像をバッチにまとめる
+    images = torch.stack(images, dim=0)
+
+    # 質問文をバッチにまとめる
+    input_ids = [item['input_ids'].squeeze() for item in questions]
+    attention_mask = [item['attention_mask'].squeeze() for item in questions]
+
+    # パディング
+    input_ids = pad_sequence(input_ids, batch_first=True, padding_value=0)
+    attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
+    questions = {'input_ids': input_ids, 'attention_mask': attention_mask}
+
+    # 回答をバッチにまとめる
+    answers = torch.stack(answers, dim=0)
+
+    # 最頻値の回答をバッチにまとめる
+    mode_answers = torch.tensor(mode_answers)
+
+    return images, questions, answers, mode_answers
+
 def main():
     # deviceの設定
     set_seed(42)
@@ -315,16 +352,15 @@ def main():
         transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2),
         transforms.ToTensor()
     ])
-    train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform,
-                               tokenizer=tokenizer)
-    test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform,
-                              tokenizer=tokenizer, answer=False)
+    train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform, tokenizer=tokenizer)
+    test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, tokenizer=tokenizer, answer=False)
     test_dataset.update_dict(train_dataset)
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True, collate_fn=collate_fn)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn)
 
-    model = VQAModel(vocab_size=len(train_dataset.question2idx) + 1, n_answer=len(train_dataset.answer2idx)).to(device)
+    # 修正: vocab_sizeを削除し、n_answerのみを渡す
+    model = VQAModel(n_answer=len(train_dataset.answer2idx)).to(device)
 
     # optimizer / criterion
     num_epoch = 20
@@ -353,7 +389,6 @@ def main():
     submission = np.array(submission)
     torch.save(model.state_dict(), "model.pth")
     np.save("submission.npy", submission)
-
 
 if __name__ == "__main__":
     main()
